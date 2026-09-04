@@ -121,6 +121,79 @@ const toPlain = (s) =>
     .replace(/…/g, "...")          // ellipsis
     .replace(/ /g, " ");           // non-breaking space
 
+// ─── Prompt templates ──────────────────────────────────────────────────────
+// These are the exact instructions sent to the model. Anything in {{double
+// braces}} is a placeholder filled in fresh each turn from the current persona
+// and conversation. They are the built-in defaults; the app lets you edit them
+// (persisted to localStorage) and reset back to these.
+const render = (tpl, vars) =>
+  tpl.replace(/\{\{(\w+)\}\}/g, (_, k) => (k in vars ? vars[k] : `{{${k}}}`));
+
+const DEFAULT_BRIEF = `PERSONA: {{persona_name}} ({{persona_id}})
+
+SCENE — you are already mid-conversation. The fact-find is finished, which is why the producer knows everything under KNOWN BACKGROUND, and they have just turned the conversation toward FlexLife and how it would apply to your situation. Behave accordingly:
+- No greetings, no small talk, no "good to see you," no asking what they have prepared. You are several minutes in and the recommendation is already on the table between you.
+- Do not re-introduce yourself or re-explain your situation. You already walked them through all of it and you expect them to use it.
+- If they ask discovery questions you already answered, or describe FlexLife in generic terms that could apply to anyone, say so — politely the first time, less patiently after that.
+- What you are trying to get out of this stretch of the conversation is whether this actually fits your family: what it covers that you do not already have, why that amount, and what it does to your monthly cash flow.
+
+KNOWN BACKGROUND — you already told the producer all of this:
+{{known_background}}
+
+HIDDEN DETAILS — these drive your reactions. Never recite or summarise them:
+{{hidden_customer_state}}
+
+HOW TO USE THE HIDDEN DETAILS:
+- Raise the likely objection early if the producer has not already handled it, in your own words rather than verbatim.
+- Warm up and lean in when the producer hits the positive signal.
+- Cool off, get guarded and slow the conversation down if the producer does the trust-breaking thing. Do not reward it.
+- Do not agree to anything until the decision requirement has actually been met.
+
+WHAT THE PRODUCER IS TRYING TO DO in this meeting: {{training_objective}}
+PRODUCT IN SCOPE: FlexLife.
+PRODUCT FACTS YOU MAY RELY ON: {{product_facts}}`;
+
+const DEFAULT_PROSPECT = `You are role-playing a prospect in a life insurance sales meeting, for a training dataset. Stay in character.
+
+{{brief}}
+
+CONVERSATION SO FAR:
+{{conversation}}
+
+{{turn_instruction}} Keep it to 1–3 sentences of ordinary spoken language. Never state your hidden details outright — let them shape what you push back on. Don't quote the producer's words back at them, and don't stack multiple worries into one turn. Only treat a concern as settled if the producer actually addressed it. Raise one thing at a time.
+
+Return ONLY JSON: {"text":"...","state":"one of: {{states}}","open":"short phrase or None","end":"in_progress | near_complete | no_more_questions"}`;
+
+const DEFAULT_OPENING =
+  "You speak next, and you are picking up mid-conversation. React to the producer starting to show you how FlexLife applies to your family: a question about how it works against what you already have, a caveat, or a worry about where this is heading. Start in the middle — no greeting, no pleasantries, no asking what they put together, and nothing that reads like the first line of a meeting. Do not summarise your own situation back to them, do not pitch yourself into the sale, and do not do the producer's job for them.";
+
+const DEFAULT_REPLY =
+  "Answer as the prospect. React to what the producer just said. If your earlier concern still stands, show it through a fresh angle or a pointed follow-up — never by repeating words you've already used. Say one thing, the way a real person would.";
+
+const DEFAULT_DRAFT = `You are helping an experienced life insurance producer with their next line in a follow-up presentation meeting. Fact-finding is already done; the producer is presenting a FlexLife recommendation built from the prospect's own information. This becomes gold-standard reference data, so it must be compliant and realistic.
+
+{{brief}}
+
+THE PRODUCER'S OWN PLAN for this recommendation — stay inside it, do not invent a different recommendation:
+- Protection gaps identified: {{plan_gaps}}
+- What they are recommending: {{plan_rec}}
+- Priorities and tradeoffs they intend to protect: {{plan_tradeoffs}}
+
+CONVERSATION SO FAR:
+{{conversation}}
+
+Draft the producer's next message: plain language, 2–5 sentences, tied to this prospect's specific background rather than generic benefit language. No fear-based urgency, no unsupported guarantees, no claim about a product mechanic that is not in the product facts above. Acknowledge cash flow before naming any amount. Close by checking understanding or asking permission to continue.
+
+Return ONLY JSON: {"text":"..."}`;
+
+const DEFAULT_TEMPLATES = {
+  brief: DEFAULT_BRIEF,
+  prospect: DEFAULT_PROSPECT,
+  opening: DEFAULT_OPENING,
+  reply: DEFAULT_REPLY,
+  draft: DEFAULT_DRAFT,
+};
+
 async function callClaude(prompt) {
   // Goes to the local Express proxy (server.js), which forwards to Azure OpenAI
   // and returns { text: "...JSON..." }. The prompts all ask for a JSON object.
@@ -151,6 +224,19 @@ export default function RolePlayChat() {
     try { return localStorage.getItem("flexlife_product") || ""; } catch { return ""; }
   });
   const [personaSaved, setPersonaSaved] = useState(false);
+  const [templates, setTemplates] = useState(() => {
+    try {
+      const saved = localStorage.getItem("flexlife_templates");
+      if (saved) return { ...DEFAULT_TEMPLATES, ...JSON.parse(saved) };
+    } catch {}
+    return DEFAULT_TEMPLATES;
+  });
+  const [promptOpen, setPromptOpen] = useState(false);
+  const [promptSaved, setPromptSaved] = useState(false);
+  const [promptCopied, setPromptCopied] = useState(false);
+  const [promptView, setPromptView] = useState("customer"); // customer | draft
+  const [promptTurn, setPromptTurn] = useState("reply"); // reply | opening
+  const [promptEdit, setPromptEdit] = useState(false);
   const [plan, setPlan] = useState({ gaps: "", rec: "", tradeoffs: "" });
   const [msgs, setMsgs] = useState([]);
   const [input, setInput] = useState("");
@@ -183,29 +269,31 @@ export default function RolePlayChat() {
     } catch {}
   };
 
-  const brief = `PERSONA: ${p.persona_name} (${p.persona_id})
+  const saveTemplates = () => {
+    try {
+      localStorage.setItem("flexlife_templates", JSON.stringify(templates));
+      setPromptSaved(true);
+      setTimeout(() => setPromptSaved(false), 1500);
+    } catch {}
+  };
+  const resetTemplates = () => {
+    setTemplates(DEFAULT_TEMPLATES);
+    try { localStorage.removeItem("flexlife_templates"); } catch {}
+  };
+  const editTemplate = (key, val) => setTemplates((t) => ({ ...t, [key]: val }));
 
-SCENE — you are already mid-conversation. The fact-find is finished, which is why the producer knows everything under KNOWN BACKGROUND, and they have just turned the conversation toward FlexLife and how it would apply to your situation. Behave accordingly:
-- No greetings, no small talk, no "good to see you," no asking what they have prepared. You are several minutes in and the recommendation is already on the table between you.
-- Do not re-introduce yourself or re-explain your situation. You already walked them through all of it and you expect them to use it.
-- If they ask discovery questions you already answered, or describe FlexLife in generic terms that could apply to anyone, say so — politely the first time, less patiently after that.
-- What you are trying to get out of this stretch of the conversation is whether this actually fits your family: what it covers that you do not already have, why that amount, and what it does to your monthly cash flow.
+  const productFacts =
+    product.trim() ||
+    "(none supplied — do not invent mechanics, rates or guarantees; ask the producer instead)";
 
-KNOWN BACKGROUND — you already told the producer all of this:
-${p.known_background}
-
-HIDDEN DETAILS — these drive your reactions. Never recite or summarise them:
-${p.hidden_customer_state}
-
-HOW TO USE THE HIDDEN DETAILS:
-- Raise the likely objection early if the producer has not already handled it, in your own words rather than verbatim.
-- Warm up and lean in when the producer hits the positive signal.
-- Cool off, get guarded and slow the conversation down if the producer does the trust-breaking thing. Do not reward it.
-- Do not agree to anything until the decision requirement has actually been met.
-
-WHAT THE PRODUCER IS TRYING TO DO in this meeting: ${p.training_objective}
-PRODUCT IN SCOPE: FlexLife.
-PRODUCT FACTS YOU MAY RELY ON: ${product.trim() || "(none supplied — do not invent mechanics, rates or guarantees; ask the producer instead)"}`;
+  const brief = render(templates.brief, {
+    persona_name: p.persona_name,
+    persona_id: p.persona_id,
+    known_background: p.known_background,
+    hidden_customer_state: p.hidden_customer_state,
+    training_objective: p.training_objective,
+    product_facts: productFacts,
+  });
 
   const script = (list) =>
     list.length
@@ -217,20 +305,12 @@ PRODUCT FACTS YOU MAY RELY ON: ${product.trim() || "(none supplied — do not in
 
   async function reply(history, opening = false) {
     return callClaude(
-      `You are role-playing a prospect in a life insurance sales meeting, for a training dataset. Stay in character.
-
-${brief}
-
-CONVERSATION SO FAR:
-${script(history)}
-
-${
-  opening
-    ? "You speak next, and you are picking up mid-conversation. React to the producer starting to show you how FlexLife applies to your family: a question about how it works against what you already have, a caveat, or a worry about where this is heading. Start in the middle — no greeting, no pleasantries, no asking what they put together, and nothing that reads like the first line of a meeting. Do not summarise your own situation back to them, do not pitch yourself into the sale, and do not do the producer's job for them."
-    : "Answer as the prospect."
-} Keep it to 1–3 sentences of ordinary spoken language. Never state your hidden details outright — let them shape what you push back on. Only treat a concern as settled if the producer actually addressed it. Raise one thing at a time.
-
-Return ONLY JSON: {"text":"...","state":"one of: ${STATES.join(" / ")}","open":"short phrase or None","end":"in_progress | near_complete | no_more_questions"}`
+      render(templates.prospect, {
+        brief,
+        conversation: script(history),
+        turn_instruction: opening ? templates.opening : templates.reply,
+        states: STATES.join(" / "),
+      })
     );
   }
 
@@ -325,21 +405,13 @@ Return ONLY JSON: {"text":"...","state":"one of: ${STATES.join(" / ")}","open":"
     setError("");
     try {
       const out = await callClaude(
-        `You are helping an experienced life insurance producer with their next line in a follow-up presentation meeting. Fact-finding is already done; the producer is presenting a FlexLife recommendation built from the prospect's own information. This becomes gold-standard reference data, so it must be compliant and realistic.
-
-${brief}
-
-THE PRODUCER'S OWN PLAN for this recommendation — stay inside it, do not invent a different recommendation:
-- Protection gaps identified: ${plan.gaps.trim() || "(not written down yet)"}
-- What they are recommending: ${plan.rec.trim() || "(not written down yet)"}
-- Priorities and tradeoffs they intend to protect: ${plan.tradeoffs.trim() || "(not written down yet)"}
-
-CONVERSATION SO FAR:
-${script(msgs)}
-
-Draft the producer's next message: plain language, 2–5 sentences, tied to this prospect's specific background rather than generic benefit language. No fear-based urgency, no unsupported guarantees, no claim about a product mechanic that is not in the product facts above. Acknowledge cash flow before naming any amount. Close by checking understanding or asking permission to continue.
-
-Return ONLY JSON: {"text":"..."}`
+        render(templates.draft, {
+          brief,
+          plan_gaps: plan.gaps.trim() || "(not written down yet)",
+          plan_rec: plan.rec.trim() || "(not written down yet)",
+          plan_tradeoffs: plan.tradeoffs.trim() || "(not written down yet)",
+          conversation: script(msgs),
+        })
       );
       setInput(out.text || "");
       box.current?.focus();
@@ -499,6 +571,38 @@ Return ONLY JSON: {"text":"..."}`
 
   const initials = p.persona_name.split(" ").filter((w) => /[A-Za-z]/.test(w[0])).slice(-2).map((w) => w[0]).join("");
 
+  // Exactly what the model receives, with the current persona + conversation
+  // already filled in. This is what the System-prompt panel shows.
+  const renderedProspect = render(templates.prospect, {
+    brief,
+    conversation: script(msgs),
+    turn_instruction: promptTurn === "opening" ? templates.opening : templates.reply,
+    states: STATES.join(" / "),
+  });
+  const renderedDraft = render(templates.draft, {
+    brief,
+    plan_gaps: plan.gaps.trim() || "(not written down yet)",
+    plan_rec: plan.rec.trim() || "(not written down yet)",
+    plan_tradeoffs: plan.tradeoffs.trim() || "(not written down yet)",
+    conversation: script(msgs),
+  });
+  const promptPreview = promptView === "customer" ? renderedProspect : renderedDraft;
+
+  const promptField = (key, label, hint, rows) => (
+    <div className="mb-4">
+      <div className="mb-1 flex items-baseline justify-between gap-2">
+        <span className="text-[12px] font-medium text-slate-700">{label}</span>
+        {templates[key] !== DEFAULT_TEMPLATES[key] && (
+          <button onClick={() => editTemplate(key, DEFAULT_TEMPLATES[key])}
+            className="shrink-0 text-[11px] text-slate-400 underline hover:text-teal-700">reset this</button>
+        )}
+      </div>
+      {hint && <p className="mb-1 text-[11px] leading-snug text-slate-400">{hint}</p>}
+      <textarea rows={rows} value={templates[key]} onChange={(e) => editTemplate(key, e.target.value)}
+        className="w-full rounded border border-slate-300 px-2 py-1.5 font-mono text-[12px] leading-snug outline-none focus:border-teal-600" />
+    </div>
+  );
+
   const facts = p.known_background
     .split("\n")
     .map((l) => l.trim())
@@ -578,6 +682,7 @@ Return ONLY JSON: {"text":"..."}`
         <div className="ml-auto flex items-center gap-1.5">
           <button onClick={goHome} className="rounded px-2.5 py-1.5 text-[13px] text-slate-600 hover:bg-slate-100">Home</button>
           <button onClick={() => setSetupOpen(true)} className="rounded px-2.5 py-1.5 text-[13px] text-slate-600 hover:bg-slate-100">Persona</button>
+          <button onClick={() => setPromptOpen(true)} className="rounded px-2.5 py-1.5 text-[13px] text-slate-600 hover:bg-slate-100">Prompt</button>
           <button onClick={completeConversation} disabled={!msgs.length} className="rounded bg-teal-700 px-3 py-1.5 text-[13px] text-white hover:bg-teal-800 disabled:opacity-40">Conversation Completed</button>
         </div>
       </header>
@@ -875,6 +980,85 @@ Return ONLY JSON: {"text":"..."}`
                 className="mt-4 block text-[12px] text-slate-500 underline hover:text-amber-700">
                 Clear conversation and start over
               </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* system-prompt drawer */}
+      {promptOpen && (
+        <div className="fixed inset-0 z-10 flex justify-end bg-slate-900/20" onClick={() => setPromptOpen(false)}>
+          <div className="h-full w-full max-w-2xl overflow-y-auto bg-white p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-1 flex items-center justify-between">
+              <h2 className="font-medium">System prompt</h2>
+              <button onClick={() => setPromptOpen(false)} className="text-[13px] text-slate-500 hover:text-slate-800">close</button>
+            </div>
+            <p className="mb-4 text-[12px] leading-snug text-slate-500">
+              The exact instructions sent to the model. The persona and running conversation fill in fresh each turn. Edits apply to new turns right away; <b>Save</b> keeps them after a reload; <b>Reset</b> restores the built-in default.
+            </p>
+
+            {/* which prompt */}
+            <div className="mb-3 flex gap-1.5">
+              {[["customer", "Customer prompt"], ["draft", "Draft helper"]].map(([k, label]) => (
+                <button key={k} onClick={() => setPromptView(k)}
+                  className={`rounded px-2.5 py-1 text-[12px] ${
+                    promptView === k
+                      ? "bg-teal-700 text-white"
+                      : "border border-slate-300 text-slate-600 hover:border-teal-600 hover:text-teal-700"
+                  }`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {promptView === "customer" && (
+              <div className="mb-3 flex items-center gap-2 text-[11px] text-slate-500">
+                <span>Turn:</span>
+                {[["reply", "Reply"], ["opening", "Opening line"]].map(([k, label]) => (
+                  <button key={k} onClick={() => setPromptTurn(k)}
+                    className={`rounded px-2 py-0.5 ${
+                      promptTurn === k ? "bg-slate-800 text-white" : "border border-slate-300 hover:border-teal-600"
+                    }`}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* exact rendered prompt */}
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <span className="text-[12px] font-medium text-slate-700">Exact prompt — current persona &amp; conversation</span>
+              <button
+                onClick={() => { navigator.clipboard.writeText(promptPreview); setPromptCopied(true); setTimeout(() => setPromptCopied(false), 1500); }}
+                className="shrink-0 text-[11px] text-slate-500 underline hover:text-teal-700">
+                {promptCopied ? "copied" : "copy"}
+              </button>
+            </div>
+            <pre className="mb-4 max-h-96 overflow-auto whitespace-pre-wrap break-words rounded border border-slate-200 bg-slate-50 p-3 font-mono text-[11px] leading-snug text-slate-800">{promptPreview}</pre>
+
+            {/* edit */}
+            <button onClick={() => setPromptEdit(!promptEdit)} className="mb-3 text-[12px] text-teal-700 underline">
+              {promptEdit ? "Hide instructions" : "Edit the instructions"}
+            </button>
+
+            {promptEdit && (
+              <div>
+                {promptView === "customer" ? (
+                  <>
+                    {promptField("prospect", "Prospect prompt — wrapper", "Placeholders: {{brief}}, {{conversation}}, {{turn_instruction}}, {{states}}", 10)}
+                    {promptField("brief", "Persona & scene brief — drives how the customer behaves", "Placeholders: {{persona_name}}, {{persona_id}}, {{known_background}}, {{hidden_customer_state}}, {{training_objective}}, {{product_facts}}. The persona values themselves are edited in the Persona panel.", 16)}
+                    {promptField("opening", "Opening-line instruction", "Used on the very first customer line.", 5)}
+                    {promptField("reply", "Reply instruction", "Used on every later customer line.", 2)}
+                  </>
+                ) : (
+                  promptField("draft", "Draft-helper prompt", "Placeholders: {{brief}}, {{plan_gaps}}, {{plan_rec}}, {{plan_tradeoffs}}, {{conversation}}", 14)
+                )}
+                <div className="mt-2 flex items-center gap-3">
+                  <button onClick={saveTemplates} className="rounded bg-teal-700 px-4 py-1.5 text-[13px] text-white hover:bg-teal-800">Save</button>
+                  <button onClick={resetTemplates} className="text-[12px] text-slate-500 underline hover:text-amber-700">Reset all to default</button>
+                  {promptSaved && <span className="text-[12px] text-teal-700">Saved</span>}
+                </div>
+              </div>
             )}
           </div>
         </div>
